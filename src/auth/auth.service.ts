@@ -1,6 +1,12 @@
-import { BadRequestException, Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Inject,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
+import { ClientProxy } from '@nestjs/microservices';
 import * as bcrypt from 'bcrypt';
 import { UsersService } from '../users/users.service';
 import { User, UserRole } from '../users/user.model';
@@ -30,6 +36,8 @@ export class AuthService {
     private readonly usersService: UsersService,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    @Inject('AUTH_USER_EVENTS')
+    private readonly userEventsClient: ClientProxy,
   ) {}
 
   async register(params: {
@@ -55,6 +63,13 @@ export class AuthService {
     const tokens = await this.getTokens(user);
     const refreshTokenHash = await this.hashData(tokens.refreshToken);
     await this.usersService.setRefreshTokenHash(user.id, refreshTokenHash);
+
+    this.userEventsClient.emit('user.created', {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+    });
 
     return { user, tokens };
   }
