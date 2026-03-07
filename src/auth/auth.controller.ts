@@ -1,14 +1,47 @@
-import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  HttpCode,
+  HttpStatus,
+  Post,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshDto } from './dto/refresh.dto';
-import { LogoutDto } from './dto/logout.dto';
 import { ValidateTokenDto } from './dto/validate-token.dto';
+import { UsersService } from '../users/users.service';
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly usersService: UsersService,
+  ) {}
+
+  @Get('me')
+  async me(@Headers('authorization') authorization: string | undefined) {
+    const raw = authorization ?? '';
+    const token = raw.startsWith('Bearer ') ? raw.slice(7).trim() : null;
+    if (!token) {
+      throw new UnauthorizedException('Missing or invalid Authorization header');
+    }
+    const payload = await this.authService.validateToken(token);
+    const user = await this.usersService.findById(payload.userId);
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+    const userId = (user as any)._id?.toString?.() ?? (user as any).id;
+    return {
+      id: userId,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+    };
+  }
 
   @Post('register')
   async register(@Body() dto: RegisterDto) {
@@ -52,8 +85,9 @@ export class AuthController {
   @Post('refresh')
   @HttpCode(HttpStatus.OK)
   async refresh(@Body() dto: RefreshDto) {
+    const refreshToken = typeof dto.refreshToken === 'string' ? dto.refreshToken.trim() : '';
     const { user, tokens } = await this.authService.refreshTokens({
-      refreshToken: dto.refreshToken,
+      refreshToken,
     });
 
     return {
@@ -69,10 +103,13 @@ export class AuthController {
 
   @Post('logout')
   @HttpCode(HttpStatus.NO_CONTENT)
-  async logout(@Body() dto: LogoutDto) {
-    await this.authService.logout({
-      refreshToken: dto.refreshToken,
-    });
+  async logout(@Headers('authorization') authorization: string | undefined) {
+    const raw = authorization ?? '';
+    const token = raw.startsWith('Bearer ') ? raw.slice(7).trim() : null;
+    if (!token) {
+      throw new UnauthorizedException('Missing or invalid Authorization header');
+    }
+    await this.authService.logoutByAccessToken(token);
   }
 
   @Post('validate')

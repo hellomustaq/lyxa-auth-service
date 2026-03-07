@@ -7,9 +7,18 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { ClientProxy } from '@nestjs/microservices';
+import { InjectModel } from 'nestjs-typegoose';
+import { ReturnModelType } from '@typegoose/typegoose';
 import * as bcrypt from 'bcrypt';
+import { randomUUID } from 'crypto';
 import { UsersService } from '../users/users.service';
 import { User, UserRole } from '../users/user.model';
+import { BlacklistedToken } from './blacklisted-token.model';
+
+function getUserId(user: User): string {
+  const doc = user as User & { _id?: { toString(): string } };
+  return doc._id?.toString?.() ?? (user as any).id ?? '';
+}
 
 export interface AuthTokens {
   accessToken: string;
@@ -20,6 +29,8 @@ export interface TokenPayload {
   sub: string;
   email: string;
   role: UserRole;
+  jti?: string;
+  exp?: number;
 }
 
 export interface ValidatedUserPayload {
@@ -38,6 +49,8 @@ export class AuthService {
     private readonly configService: ConfigService,
     @Inject('AUTH_USER_EVENTS')
     private readonly userEventsClient: ClientProxy,
+    @InjectModel(BlacklistedToken)
+    private readonly blacklistedTokenModel: ReturnModelType<typeof BlacklistedToken>,
   ) {}
 
   async register(params: {
@@ -62,10 +75,11 @@ export class AuthService {
 
     const tokens = await this.getTokens(user);
     const refreshTokenHash = await this.hashData(tokens.refreshToken);
-    await this.usersService.setRefreshTokenHash(user.id, refreshTokenHash);
+    const userId = getUserId(user);
+    await this.usersService.setRefreshTokenHash(userId, refreshTokenHash);
 
     this.userEventsClient.emit('user.created', {
-      id: user.id,
+      id: userId,
       email: user.email,
       name: user.name,
       role: user.role,
@@ -90,7 +104,7 @@ export class AuthService {
 
     const tokens = await this.getTokens(user);
     const refreshTokenHash = await this.hashData(tokens.refreshToken);
-    await this.usersService.setRefreshTokenHash(user.id, refreshTokenHash);
+    await this.usersService.setRefreshTokenHash(getUserId(user), refreshTokenHash);
 
     return { user, tokens };
   }
@@ -103,9 +117,14 @@ export class AuthService {
       throw new Error('JWT_REFRESH_SECRET is not configured');
     }
 
+    const token = params.refreshToken?.trim?.() ?? '';
+    if (!token) {
+      throw new UnauthorizedException('Refresh token is required');
+    }
+
     let payload: TokenPayload;
     try {
-      payload = await this.jwtService.verifyAsync<TokenPayload>(params.refreshToken, {
+      payload = await this.jwtService.verifyAsync<TokenPayload>(token, {
         secret: refreshSecret,
       });
     } catch {
@@ -118,7 +137,7 @@ export class AuthService {
     }
 
     const refreshMatches = await bcrypt.compare(
-      params.refreshToken,
+      token,
       user.refreshTokenHash,
     );
     if (!refreshMatches) {
@@ -127,7 +146,7 @@ export class AuthService {
 
     const tokens = await this.getTokens(user);
     const newRefreshHash = await this.hashData(tokens.refreshToken);
-    await this.usersService.setRefreshTokenHash(user.id, newRefreshHash);
+    await this.usersService.setRefreshTokenHash(getUserId(user), newRefreshHash);
 
     return { user, tokens };
   }
@@ -138,14 +157,22 @@ export class AuthService {
       throw new Error('JWT_REFRESH_SECRET is not configured');
     }
 
+    const token = params.refreshToken?.trim?.() ?? '';
+    if (!token) {
+      throw new UnauthorizedException('Refresh token is required');
+    }
+
     let payload: TokenPayload;
     try {
-      payload = await this.jwtService.verifyAsync<TokenPayload>(params.refreshToken, {
+      payload = await this.jwtService.verifyAsync<TokenPayload>(token, {
         secret: refreshSecret,
       });
-    } catch {
-      // If token is invalid, we just do nothing specific for simplicity
-      throw new UnauthorizedException('Invalid refresh token');
+    } catch (err) {
+      const msg =
+        err?.name === 'TokenExpiredError'
+          ? 'Refresh token expired'
+          : 'Invalid refresh token';
+      throw new UnauthorizedException(msg);
     }
 
     const user = await this.usersService.findById(payload.sub);
@@ -153,7 +180,36 @@ export class AuthService {
       throw new UnauthorizedException('Invalid refresh token');
     }
 
-    await this.usersService.setRefreshTokenHash(user.id, null);
+    await this.usersService.setRefreshTokenHash(getUserId(user), null);
+  }
+
+  async logoutByAccessToken(accessToken: string): Promise<void> {
+    const accessSecret = this.configService.get<string>('JWT_ACCESS_SECRET');
+    if (!accessSecret) {
+      throw new Error('JWT_ACCESS_SECRET is not configured');
+    }
+
+    let payload: TokenPayload;
+    try {
+      payload = await this.jwtService.verifyAsync<TokenPayload>(accessToken, {
+        secret: accessSecret,
+      });
+    } catch (err) {
+      const msg =
+        err?.name === 'TokenExpiredError'
+          ? 'Access token expired'
+          : 'Invalid access token';
+      throw new UnauthorizedException(msg);
+    }
+
+    if (payload.jti) {
+      const expDate = payload.exp
+        ? new Date(payload.exp * 1000)
+        : new Date(Date.now() + 24 * 60 * 60 * 1000);
+      await this.blacklistedTokenModel.create({ jti: payload.jti, exp: expDate });
+    }
+
+    await this.usersService.setRefreshTokenHash(payload.sub, null);
   }
 
   async validateToken(token: string): Promise<ValidatedUserPayload> {
@@ -167,8 +223,19 @@ export class AuthService {
       payload = await this.jwtService.verifyAsync<TokenPayload>(token, {
         secret: accessSecret,
       });
-    } catch {
-      throw new UnauthorizedException('Invalid access token');
+    } catch (err) {
+      const msg =
+        err?.name === 'TokenExpiredError'
+          ? 'Access token expired'
+          : 'Invalid access token';
+      throw new UnauthorizedException(msg);
+    }
+
+    if (payload.jti) {
+      const found = await this.blacklistedTokenModel.findOne({ jti: payload.jti }).exec();
+      if (found) {
+        throw new UnauthorizedException('Access token has been revoked');
+      }
     }
 
     const user = await this.usersService.findById(payload.sub);
@@ -177,15 +244,16 @@ export class AuthService {
     }
 
     return {
-      userId: user.id,
+      userId: getUserId(user),
       email: user.email,
       role: user.role,
     };
   }
 
   private async getTokens(user: User): Promise<AuthTokens> {
-    const payload: TokenPayload = {
-      sub: user.id,
+    const userId = getUserId(user);
+    const basePayload = {
+      sub: userId,
       email: user.email,
       role: user.role,
     };
@@ -203,11 +271,14 @@ export class AuthService {
     }
 
     const [accessToken, refreshToken] = await Promise.all([
-      this.jwtService.signAsync(payload, {
-        secret: accessSecret,
-        expiresIn: accessExpiresIn,
-      }),
-      this.jwtService.signAsync(payload, {
+      this.jwtService.signAsync(
+        { ...basePayload, jti: randomUUID() },
+        {
+          secret: accessSecret,
+          expiresIn: accessExpiresIn,
+        },
+      ),
+      this.jwtService.signAsync(basePayload, {
         secret: refreshSecret,
         expiresIn: refreshExpiresIn,
       }),
