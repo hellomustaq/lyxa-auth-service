@@ -21,7 +21,7 @@ NestJS service that handles user registration, login, JWT access/refresh tokens,
 1. **Install dependencies**
 
    ```bash
-   npm install --legacy-peer-deps
+   npm install
    ```
 
 2. **Environment**
